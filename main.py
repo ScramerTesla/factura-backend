@@ -1,17 +1,16 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict
 import pandas as pd
 import fitz  # PyMuPDF
 import re
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
 
 app = FastAPI()
 
-# 1) CORS - permitir cualquier origen
+# Permitir CORS desde cualquier origen
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,10 +22,6 @@ class ConsumoRequest(BaseModel):
     dias_factura: int
     potencia: Dict[str, float]
     energia: Dict[str, float]
-
-@app.get("/ping")
-async def ping():
-    return {"pong": True}
 
 def extract(pattern: str, text: str, fmt=float, label: str = None, default=None):
     m = re.search(pattern, text, flags=re.IGNORECASE)
@@ -54,7 +49,7 @@ async def analizar_factura(file: UploadFile = File(...)):
 
         total_factura    = extract(r"TOTAL IMPORTE FACTURA\D*([\d,]+,[\d]{2})\s*€", text, float, "Total factura")
         factura_impuesto = extract(r"IVA.*?([\d,]+,[\d]{2})\s*€", text, float, "IVA", default=0.0)
-        factura_alquiler = extract(r"Alquiler equipos medida.*?([\d,]+,[\d]{2})\s*€", text, float, "Alquiler contador", default=0.0)
+        factura_alquiler = extract(r"Alquiler equipos medida.*?([\d,]+,[\d]{2})\s*€", text, float, "Alquiler", default=0.0)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al extraer datos del PDF: {e}")
 
@@ -64,40 +59,35 @@ async def analizar_factura(file: UploadFile = File(...)):
         "energia": {"punta": consumo_punta, "llano": consumo_llano, "valle": consumo_valle},
         "factura_total": round(total_factura, 2),
         "factura_impuesto": round(factura_impuesto, 2),
-        "factura_alquiler": round(factura_alquiler, 2)
+        "factura_alquiler": round(factura_alquiler, 2),
     }
 
 @app.post("/comparar-tarifas")
 async def comparar_tarifas(consumo: ConsumoRequest):
     try:
-        excel = "Comparador electricidad.v3 (1).xlsx"
-        # Leer con pandas
-        df = pd.read_excel(excel, sheet_name="Comparador")
+        excel_path = "Comparador electricidad.v3 (1).xlsx"
+        df = pd.read_excel(excel_path, sheet_name="Comparador")
+        num_tarifas = df.shape[1] - 4  # columnas desde E en adelante
+
+        # Precios de potencia
         pot = df.iloc[[0,6,7],4:].transpose().reset_index(drop=True)
         pot.columns = ["nombre","potencia_punta","potencia_valle"]
         pot = pot.apply(pd.to_numeric, errors="coerce")
 
+        # Precios de energía
         ene = df.iloc[[11,12,13],4:].transpose().reset_index(drop=True)
         ene.columns = ["energia_punta","energia_llano","energia_valle"]
         ene = ene.apply(pd.to_numeric, errors="coerce")
 
-        # Leer enlaces con openpyxl (sin modo read_only)
-        wb = load_workbook(excel)
+        # Enlaces de fila 2
+        wb = load_workbook(excel_path)
         ws = wb["Comparador"]
-        # Mapear hyperlinks por columna index
-        link_map = {}
-        for hl in ws.hyperlinks:
-            coord = hl.ref  # e.g. 'E2'
-            col_letter = re.match(r"([A-Z]+)", coord).group(1)
-            col_idx = pd.io.common.extract_column_index_from_name(col_letter)  # or use openpyxl.utils.column_index_from_string
-            link_map[col_idx] = hl.target
+        row2 = ws[2]  # segunda fila
+        enlace_cells = row2[4:4+num_tarifas]
+        enlaces = [cell.hyperlink.target if cell.hyperlink else "" for cell in enlace_cells]
         wb.close()
 
-        # Construir lista de enlaces en orden de columnas 5 en adelante
-        enlaces = []
-        for idx in range(5, 5 + pot.shape[0]):
-            enlaces.append(link_map.get(idx, ""))
-
+        # Combinar en DataFrame
         tarifas = pd.concat([pot, ene], axis=1).reset_index(drop=True)
         tarifas["enlace"] = enlaces
         tarifas = tarifas.dropna(subset=["potencia_punta","potencia_valle","energia_punta"])
@@ -105,13 +95,13 @@ async def comparar_tarifas(consumo: ConsumoRequest):
         resultados = []
         for _, r in tarifas.iterrows():
             cp = (
-                consumo.potencia["punta"] * r["potencia_punta"] * consumo.dias_factura +
-                consumo.potencia["valle"] * r["potencia_valle"] * consumo.dias_factura
+                consumo.potencia["punta"]*r["potencia_punta"]*consumo.dias_factura +
+                consumo.potencia["valle"]*r["potencia_valle"]*consumo.dias_factura
             )
             ce = (
-                consumo.energia["punta"] * r["energia_punta"] +
-                consumo.energia["llano"] * r["energia_llano"] +
-                consumo.energia["valle"] * r["energia_valle"]
+                consumo.energia["punta"]*r["energia_punta"] +
+                consumo.energia["llano"]*r["energia_llano"] +
+                consumo.energia["valle"]*r["energia_valle"]
             )
             var = round(cp + ce, 2)
             resultados.append({
