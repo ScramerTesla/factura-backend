@@ -1,18 +1,5 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-
-# --- IMPORTANTE: CORS debe configurarse antes de cualquier ruta ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],       # Permite cualquier origen
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Ahora importamos lo demás
 from pydantic import BaseModel
 from typing import Dict
 import pandas as pd
@@ -20,18 +7,16 @@ import fitz  # PyMuPDF
 import re
 from openpyxl import load_workbook
 
-
 app = FastAPI()
 
-# Permite CORS desde cualquier origen
+# 1) CORS: permitir cualquier origen (incluidos tus previews)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # <-- aquí
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 class ConsumoRequest(BaseModel):
     dias_factura: int
@@ -46,7 +31,7 @@ async def analizar_factura(file: UploadFile = File(...)):
         for page in doc:
             text += page.get_text()
 
-    # Extraer datos de la factura
+    # Extraer datos
     dias = int(re.search(r"DIAS FACTURADOS:\s*(\d+)", text).group(1))
     potencia_punta = float(re.search(r"Potencia punta:\s*([\d,]+)", text).group(1).replace(",", "."))
     potencia_valle = float(re.search(r"Potencia valle:\s*([\d,]+)", text).group(1).replace(",", "."))
@@ -84,27 +69,32 @@ async def comparar_tarifas(consumo: ConsumoRequest):
     excel_path = "Comparador electricidad.v3 (1).xlsx"
     df = pd.read_excel(excel_path, sheet_name="Comparador")
 
-    # Precios potencia
+    # Precios de potencia
     pot = df.iloc[[0, 6, 7], 4:].transpose().reset_index(drop=True)
     pot.columns = ["nombre", "potencia_punta", "potencia_valle"]
     pot["potencia_punta"] = pd.to_numeric(pot["potencia_punta"], errors="coerce")
     pot["potencia_valle"] = pd.to_numeric(pot["potencia_valle"], errors="coerce")
-    # Precios energía
+
+    # Precios de energía
     ene = df.iloc[[11, 12, 13], 4:].transpose().reset_index(drop=True)
     ene.columns = ["energia_punta", "energia_llano", "energia_valle"]
     ene = ene.apply(pd.to_numeric, errors="coerce")
-    # Enlaces
+
+    # Hipervínculos de la fila 2
     wb = load_workbook(excel_path, read_only=True)
     ws = wb["Comparador"]
-    hiper = []
-    for cell in list(ws.iter_rows(min_row=2, max_row=2, min_col=5, values_only=False))[0]:
-        hiper.append(cell.hyperlink.target if cell.hyperlink else "")
-    enlaces = pd.Series(hiper, name="enlace")
+    enlaces = [
+        cell.hyperlink.target if cell.hyperlink else ""
+        for cell in list(ws.iter_rows(min_row=2, max_row=2, min_col=5, values_only=False))[0]
+    ]
 
-    tarifas = pd.concat([pot, ene, enlaces], axis=1).dropna(subset=["potencia_punta","potencia_valle","energia_punta"])
+    tarifas = pd.concat([pot, ene], axis=1).reset_index(drop=True)
+    tarifas["enlace"] = enlaces
+    tarifas = tarifas.dropna(subset=["potencia_punta", "potencia_valle", "energia_punta"])
 
     resultados = []
     for _, row in tarifas.iterrows():
+        # Coste variable
         cp = (
             consumo.potencia["punta"] * row["potencia_punta"] * consumo.dias_factura +
             consumo.potencia["valle"] * row["potencia_valle"] * consumo.dias_factura
@@ -114,16 +104,12 @@ async def comparar_tarifas(consumo: ConsumoRequest):
             consumo.energia["llano"] * row["energia_llano"] +
             consumo.energia["valle"] * row["energia_valle"]
         )
-        ct_var = cp + ce
-        # coste fijo enviado por front: impuesto + alquiler
-        ct_fij = consumo.__dict__.get("factura_impuesto", 0) + consumo.__dict__.get("factura_alquiler", 0)
+        var = round(cp + ce, 2)
         resultados.append({
             "tarifa": row["nombre"],
-            "coste_variable": round(ct_var, 2),
-            "coste_fijo": round(ct_fij, 2),
-            "coste_total": round(ct_var + ct_fij, 2),
+            "coste_variable": var,
             "enlace": row["enlace"]
         })
 
-    resultados.sort(key=lambda x: x["coste_total"])
+    resultados.sort(key=lambda x: x["coste_variable"])
     return resultados
