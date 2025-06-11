@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict
 import pandas as pd
@@ -10,7 +10,7 @@ from openpyxl import load_workbook
 
 app = FastAPI()
 
-# --- Middleware CORS para todos los orígenes ---
+# Permitir CORS desde cualquier origen
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,9 +27,12 @@ class ConsumoRequest(BaseModel):
 async def ping():
     return {"pong": True}
 
-def extract(pattern: str, text: str, fmt=float, label: str = None):
+def extract(pattern: str, text: str, fmt=float, label: str = None, default=None):
+    """Busca pattern en text y devuelve group(1) formateado o default si no encuentra."""
     m = re.search(pattern, text, flags=re.IGNORECASE)
     if not m:
+        if default is not None:
+            return default
         lbl = f" '{label}'" if label else ""
         raise ValueError(f"No se encontró el campo{lbl}.")
     val = m.group(1).replace(",", ".")
@@ -43,16 +46,16 @@ async def analizar_factura(file: UploadFile = File(...)):
         text = "".join(page.get_text() for page in doc)
         doc.close()
 
-        dias              = extract(r"DIAS FACTURADOS:\s*(\d+)", text, int, "Días")
-        potencia_punta    = extract(r"Potencia punta:\s*([\d,]+)\s*kW", text, float, "Potencia punta")
-        potencia_valle    = extract(r"Potencia valle:\s*([\d,]+)\s*kW", text, float, "Potencia valle")
-        consumo_punta     = extract(r"punta:\s*([\d,]+)\s*kWh", text, float, "Consumo punta")
-        consumo_llano     = extract(r"llano:\s*([\d,]+)\s*kWh", text, float, "Consumo llano")
-        consumo_valle     = extract(r"valle[: ]\s*([\d,]+)\s*kWh", text, float, "Consumo valle")
+        dias             = extract(r"DIAS FACTURADOS:\s*(\d+)", text, int, "Días")
+        potencia_punta   = extract(r"Potencia punta:\s*([\d,]+)\s*kW", text, float, "Potencia punta")
+        potencia_valle   = extract(r"Potencia valle:\s*([\d,]+)\s*kW", text, float, "Potencia valle")
+        consumo_punta    = extract(r"punta:\s*([\d,]+)\s*kWh", text, float, "Consumo punta")
+        consumo_llano    = extract(r"llano:\s*([\d,]+)\s*kWh", text, float, "Consumo llano")
+        consumo_valle    = extract(r"valle[: ]\s*([\d,]+)\s*kWh", text, float, "Consumo valle")
 
-        total_factura     = extract(r"TOTAL IMPORTE FACTURA\D*([\d,]+,[\d]{2})\s*€", text, float, "Total factura")
-        factura_impuesto  = extract(r"IVA.*?([\d,]+,[\d]{2})\s*€", text, float, "IVA")
-        factura_alquiler  = extract(r"Alquiler equipos medida.*?([\d,]+,[\d]{2})\s*€", text, float, "Alquiler")
+        total_factura    = extract(r"TOTAL IMPORTE FACTURA\D*([\d,]+,[\d]{2})\s*€", text, float, "Total factura")
+        factura_impuesto = extract(r"IVA.*?([\d,]+,[\d]{2})\s*€", text, float, "IVA", default=0.0)
+        factura_alquiler = extract(r"Alquiler equipos medida.*?([\d,]+,[\d]{2})\s*€", text, float, "Alquiler", default=0.0)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al extraer datos del PDF: {e}")
@@ -82,7 +85,7 @@ async def comparar_tarifas(consumo: ConsumoRequest):
         ene.columns = ["energia_punta","energia_llano","energia_valle"]
         ene = ene.apply(pd.to_numeric, errors="coerce")
 
-        # Enlaces de la fila 2
+        # Enlaces (fila 2)
         wb = load_workbook(excel, read_only=True)
         ws = wb["Comparador"]
         enlaces = [cell.hyperlink.target if cell.hyperlink else "" for cell in ws[2][4:]]
@@ -95,22 +98,27 @@ async def comparar_tarifas(consumo: ConsumoRequest):
         resultados = []
         for _, r in tarifas.iterrows():
             cp = (
-                consumo.potencia["punta"] * r["potencia_punta"] * consumo.dias_factura +
-                consumo.potencia["valle"] * r["potencia_valle"] * consumo.dias_factura
+                consumo.potencia["punta"]*r["potencia_punta"]*consumo.dias_factura +
+                consumo.potencia["valle"]*r["potencia_valle"]*consumo.dias_factura
             )
             ce = (
-                consumo.energia["punta"] * r["energia_punta"] +
-                consumo.energia["llano"] * r["energia_llano"] +
-                consumo.energia["valle"] * r["energia_valle"]
+                consumo.energia["punta"]*r["energia_punta"] +
+                consumo.energia["llano"]*r["energia_llano"] +
+                consumo.energia["valle"]*r["energia_valle"]
             )
             var = round(cp + ce, 2)
+            # Incluimos aquí el coste fijo extraído antes
+            fijo = consumo.__dict__.get("factura_impuesto", 0) + consumo.__dict__.get("factura_alquiler", 0)
+            total = round(var + fijo, 2)
             resultados.append({
                 "tarifa": r["nombre"],
                 "coste_variable": var,
+                "coste_fijo": round(fijo, 2),
+                "coste_total": total,
                 "enlace": r["enlace"]
             })
 
-        resultados.sort(key=lambda x: x["coste_variable"])
+        resultados.sort(key=lambda x: x["coste_total"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al comparar tarifas: {e}")
 
