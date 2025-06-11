@@ -1,16 +1,17 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Dict
 import pandas as pd
-import fitz  # PyMuPDF
+import fitz
 import re
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 app = FastAPI()
 
-# Permitir CORS desde cualquier origen
+# CORS abierto para todos los orígenes
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,87 +24,88 @@ class ConsumoRequest(BaseModel):
     potencia: Dict[str, float]
     energia: Dict[str, float]
 
-def extract(pattern: str, text: str, fmt=float, label: str = None, default=None):
+def extract(pattern: str, text: str, fmt=float, label=None, default=None):
     m = re.search(pattern, text, flags=re.IGNORECASE)
     if not m:
         if default is not None:
             return default
-        lbl = f" '{label}'" if label else ""
-        raise ValueError(f"No se encontró el campo{lbl}.")
+        raise ValueError(f"No se encontró el campo '{label}'")
     return fmt(m.group(1).replace(",", "."))
 
 @app.post("/analizar-factura")
 async def analizar_factura(file: UploadFile = File(...)):
     try:
-        contents = await file.read()
-        doc = fitz.open(stream=contents, filetype="pdf")
-        text = "".join(page.get_text() for page in doc)
+        data = await file.read()
+        doc = fitz.open(stream=data, filetype="pdf")
+        text = "".join(p.get_text() for p in doc)
         doc.close()
 
-        dias             = extract(r"DIAS FACTURADOS:\s*(\d+)", text, int, "Días facturados")
-        potencia_punta   = extract(r"Potencia punta:\s*([\d,]+)\s*kW", text, float, "Potencia punta")
-        potencia_valle   = extract(r"Potencia valle:\s*([\d,]+)\s*kW", text, float, "Potencia valle")
-        consumo_punta    = extract(r"punta:\s*([\d,]+)\s*kWh", text, float, "Consumo punta")
-        consumo_llano    = extract(r"llano:\s*([\d,]+)\s*kWh", text, float, "Consumo llano")
-        consumo_valle    = extract(r"valle[: ]\s*([\d,]+)\s*kWh", text, float, "Consumo valle")
+        dias  = extract(r"DIAS FACTURADOS:\s*(\d+)", text, int, "Días")
+        pp    = extract(r"Potencia punta:\s*([\d,]+)\s*kW", text, float, "Potencia punta")
+        pv    = extract(r"Potencia valle:\s*([\d,]+)\s*kW", text, float, "Potencia valle")
+        cp    = extract(r"punta:\s*([\d,]+)\s*kWh", text, float, "Consumo punta")
+        cl    = extract(r"llano:\s*([\d,]+)\s*kWh", text, float, "Consumo llano")
+        cv    = extract(r"valle[: ]\s*([\d,]+)\s*kWh", text, float, "Consumo valle")
 
-        total_factura    = extract(r"TOTAL IMPORTE FACTURA\D*([\d,]+,[\d]{2})\s*€", text, float, "Total factura")
-        factura_impuesto = extract(r"IVA.*?([\d,]+,[\d]{2})\s*€", text, float, "IVA", default=0.0)
-        factura_alquiler = extract(r"Alquiler equipos medida.*?([\d,]+,[\d]{2})\s*€", text, float, "Alquiler", default=0.0)
+        tf    = extract(r"TOTAL IMPORTE FACTURA\D*([\d,]+,[\d]{2})\s*€", text, float, "Total factura")
+        iva   = extract(r"IVA.*?([\d,]+,[\d]{2})\s*€", text, float, "IVA", default=0.0)
+        alqu  = extract(r"Alquiler equipos medida.*?([\d,]+,[\d]{2})\s*€", text, float, "Alquiler", default=0.0)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al extraer datos del PDF: {e}")
+        raise HTTPException(status_code=500, detail=f"Error extrayendo PDF: {e}")
 
     return {
         "dias_factura": dias,
-        "potencia": {"punta": potencia_punta, "valle": potencia_valle},
-        "energia": {"punta": consumo_punta, "llano": consumo_llano, "valle": consumo_valle},
-        "factura_total": round(total_factura, 2),
-        "factura_impuesto": round(factura_impuesto, 2),
-        "factura_alquiler": round(factura_alquiler, 2),
+        "potencia": {"punta": pp, "valle": pv},
+        "energia": {"punta": cp, "llano": cl, "valle": cv},
+        "factura_total": round(tf, 2),
+        "factura_impuesto": round(iva, 2),
+        "factura_alquiler": round(alqu, 2)
     }
 
 @app.post("/comparar-tarifas")
 async def comparar_tarifas(consumo: ConsumoRequest):
     try:
-        excel_path = "Comparador electricidad.v3 (1).xlsx"
-        df = pd.read_excel(excel_path, sheet_name="Comparador")
-        num_tarifas = df.shape[1] - 4  # columnas desde E en adelante
+        excel = "Comparador electricidad.v3 (1).xlsx"
+        df = pd.read_excel(excel, sheet_name="Comparador")
 
-        # Precios de potencia
+        # Precios: potencia y energía
         pot = df.iloc[[0,6,7],4:].transpose().reset_index(drop=True)
         pot.columns = ["nombre","potencia_punta","potencia_valle"]
         pot = pot.apply(pd.to_numeric, errors="coerce")
-
-        # Precios de energía
         ene = df.iloc[[11,12,13],4:].transpose().reset_index(drop=True)
         ene.columns = ["energia_punta","energia_llano","energia_valle"]
         ene = ene.apply(pd.to_numeric, errors="coerce")
 
-        # Enlaces de fila 2
-        wb = load_workbook(excel_path)
+        # Enlaces: usamos ws._hyperlinks
+        wb = load_workbook(excel)
         ws = wb["Comparador"]
-        row2 = ws[2]  # segunda fila
-        enlace_cells = row2[4:4+num_tarifas]
-        enlaces = [cell.hyperlink.target if cell.hyperlink else "" for cell in enlace_cells]
+        links = {}
+        for hl in ws._hyperlinks:
+            # hl.ref es la celda, hl.target la URL
+            links[hl.ref] = hl.target
         wb.close()
 
-        # Combinar en DataFrame
+        # Recorrer columnas desde E (col 5) hasta el final
+        n = pot.shape[0]
+        enlace_list = []
+        for i in range(n):
+            col = get_column_letter(5 + i)  # col E es 5
+            ref = f"{col}2"
+            enlace_list.append(links.get(ref, ""))
+
+        # Combinar DataFrame
         tarifas = pd.concat([pot, ene], axis=1).reset_index(drop=True)
-        tarifas["enlace"] = enlaces
-        tarifas = tarifas.dropna(subset=["potencia_punta","potencia_valle","energia_punta"])
+        tarifas["enlace"] = enlace_list
 
         resultados = []
         for _, r in tarifas.iterrows():
-            cp = (
-                consumo.potencia["punta"]*r["potencia_punta"]*consumo.dias_factura +
-                consumo.potencia["valle"]*r["potencia_valle"]*consumo.dias_factura
-            )
-            ce = (
-                consumo.energia["punta"]*r["energia_punta"] +
-                consumo.energia["llano"]*r["energia_llano"] +
-                consumo.energia["valle"]*r["energia_valle"]
-            )
-            var = round(cp + ce, 2)
+            cost_p = consumo.potencia["punta"]*r["potencia_punta"]*consumo.dias_factura \
+                   + consumo.potencia["valle"]*r["potencia_valle"]*consumo.dias_factura
+            cost_e = consumo.energia["punta"]*r["energia_punta"] \
+                   + consumo.energia["llano"]*r["energia_llano"] \
+                   + consumo.energia["valle"]*r["energia_valle"]
+            var = round(cost_p + cost_e, 2)
             resultados.append({
                 "tarifa": r["nombre"],
                 "coste_variable": var,
@@ -112,6 +114,6 @@ async def comparar_tarifas(consumo: ConsumoRequest):
 
         resultados.sort(key=lambda x: x["coste_variable"])
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al comparar tarifas: {e}")
+        raise HTTPException(status_code=500, detail=f"Error comparando tarifas: {e}")
 
     return JSONResponse(resultados)
