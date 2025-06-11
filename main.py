@@ -5,22 +5,19 @@ from typing import Dict
 import pandas as pd
 import fitz  # PyMuPDF
 import re
-from openpyxl import load_workbook
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# --- Configuración CORS: permite tu frontend y también localhost para pruebas
+# Permite CORS desde cualquier origen
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://factura-frontend.vercel.app",
-        "https://factura-frontend-rho.vercel.app",
-        "http://localhost:5173"
-    ],
+    allow_origins=["*"],            # <-- aquí
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 class ConsumoRequest(BaseModel):
     dias_factura: int
