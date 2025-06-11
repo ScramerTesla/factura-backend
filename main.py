@@ -1,11 +1,25 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# --- IMPORTANTE: CORS debe configurarse antes de cualquier ruta ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],       # Permite cualquier origen
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Ahora importamos lo demás
 from pydantic import BaseModel
 from typing import Dict
 import pandas as pd
 import fitz  # PyMuPDF
 import re
-from fastapi.middleware.cors import CORSMiddleware
+from openpyxl import load_workbook
+
 
 app = FastAPI()
 
