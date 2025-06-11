@@ -8,10 +8,18 @@ import re
 from openpyxl import load_workbook
 
 app = FastAPI()
+
+# --- Configuración CORS: permite tu frontend y también localhost para pruebas
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=[
+        "https://factura-frontend.vercel.app",
+        "https://factura-frontend-rho.vercel.app",
+        "http://localhost:5173"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 class ConsumoRequest(BaseModel):
@@ -27,7 +35,7 @@ async def analizar_factura(file: UploadFile = File(...)):
         for page in doc:
             text += page.get_text()
 
-    # Días, potencia y consumos
+    # Extraer datos de la factura
     dias = int(re.search(r"DIAS FACTURADOS:\s*(\d+)", text).group(1))
     potencia_punta = float(re.search(r"Potencia punta:\s*([\d,]+)", text).group(1).replace(",", "."))
     potencia_valle = float(re.search(r"Potencia valle:\s*([\d,]+)", text).group(1).replace(",", "."))
@@ -35,21 +43,20 @@ async def analizar_factura(file: UploadFile = File(...)):
     consumo_llano = float(re.search(r"llano:\s*([\d,]+)\s*kWh", text).group(1).replace(",", "."))
     consumo_valle = float(re.search(r"valle\s*([\d,]+)\s*kWh", text).group(1).replace(",", "."))
 
-    # Total factura (solo para mostrar)
     total_factura = float(
         re.search(r"TOTAL IMPORTE FACTURA\s*([\d,]+,[\d]{2})\s*€", text)
-        .group(1).replace(",", ".")
+        .group(1)
+        .replace(",", ".")
     )
-
-    # Impuesto (IVA)
     iva = float(
-        re.search(r"IVA\s*[\d]{1,3}%.*?([\d,]+,[\d]{2})\s*€", text)
-        .group(1).replace(",", ".")
+        re.search(r"IVA.*?([\d,]+,[\d]{2})\s*€", text)
+        .group(1)
+        .replace(",", ".")
     )
-    # Alquiler de contador
     alquiler = float(
         re.search(r"Alquiler equipos medida.*?([\d,]+,[\d]{2})\s*€", text)
-        .group(1).replace(",", ".")
+        .group(1)
+        .replace(",", ".")
     )
 
     return {
@@ -64,19 +71,18 @@ async def analizar_factura(file: UploadFile = File(...)):
 @app.post("/comparar-tarifas/")
 async def comparar_tarifas(consumo: ConsumoRequest):
     excel_path = "Comparador electricidad.v3 (1).xlsx"
-
-    # Cargamos precios con pandas
     df = pd.read_excel(excel_path, sheet_name="Comparador")
+
+    # Precios potencia
     pot = df.iloc[[0, 6, 7], 4:].transpose().reset_index(drop=True)
     pot.columns = ["nombre", "potencia_punta", "potencia_valle"]
     pot["potencia_punta"] = pd.to_numeric(pot["potencia_punta"], errors="coerce")
     pot["potencia_valle"] = pd.to_numeric(pot["potencia_valle"], errors="coerce")
-
+    # Precios energía
     ene = df.iloc[[11, 12, 13], 4:].transpose().reset_index(drop=True)
     ene.columns = ["energia_punta", "energia_llano", "energia_valle"]
     ene = ene.apply(pd.to_numeric, errors="coerce")
-
-    # Extraemos enlaces
+    # Enlaces
     wb = load_workbook(excel_path, read_only=True)
     ws = wb["Comparador"]
     hiper = []
@@ -88,25 +94,25 @@ async def comparar_tarifas(consumo: ConsumoRequest):
 
     resultados = []
     for _, row in tarifas.iterrows():
-        # Término potencia
         cp = (
             consumo.potencia["punta"] * row["potencia_punta"] * consumo.dias_factura +
             consumo.potencia["valle"] * row["potencia_valle"] * consumo.dias_factura
         )
-        # Término energía
         ce = (
             consumo.energia["punta"] * row["energia_punta"] +
             consumo.energia["llano"] * row["energia_llano"] +
             consumo.energia["valle"] * row["energia_valle"]
         )
-        # Coste variable
-        var = round(cp + ce, 2)
-        # No conocemos fijo aquí: lo envía el front en la solicitud
+        ct_var = cp + ce
+        # coste fijo enviado por front: impuesto + alquiler
+        ct_fij = consumo.__dict__.get("factura_impuesto", 0) + consumo.__dict__.get("factura_alquiler", 0)
         resultados.append({
             "tarifa": row["nombre"],
-            "coste_variable": var,
+            "coste_variable": round(ct_var, 2),
+            "coste_fijo": round(ct_fij, 2),
+            "coste_total": round(ct_var + ct_fij, 2),
             "enlace": row["enlace"]
         })
 
-    resultados.sort(key=lambda x: x["coste_variable"])
+    resultados.sort(key=lambda x: x["coste_total"])
     return resultados
